@@ -1,0 +1,221 @@
+# Build this fork of ast-grep and release the binary for each platform.
+#
+# This fork reads C++ with the tree-sitter fork of GrigoryEvko. The release lets a CI job pin a
+# binary, so the job needs no Rust toolchain and no network beyond the download.
+#
+# The upstream workflows of this repository release on a tag that starts with a digit. This workflow
+# takes the namespace `fork-v`, so the two never start together.
+name: Release the fork binary
+
+on:
+  push:
+    tags:
+      - 'fork-v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'The tag to release, for example fork-v1'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  # Pin the toolchain. `rust-toolchain.toml` names the stable channel, and a release is reproducible
+  # only at one version.
+  RUST_TOOLCHAIN: '1.98.1'
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each runner builds for itself, because each job runs the binary that it builds.
+          - { platform: linux-x64,   os: ubuntu-24.04 }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm }
+          - { platform: macos-arm64, os: macos-15 }
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+
+      - name: Name the tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "name=${{ github.event.inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      # `--locked` refuses a dependency that the lock file does not name. A release that resolves a
+      # new version is not reproducible.
+      - name: Build the binary
+        run: cargo build --release --locked -p ast-grep
+
+      # A BINARY WITH THE PUBLISHED C++ GRAMMAR FAILS THIS TEST. The fork reads an attribute macro
+      # inside a parenthesized reference declarator, and the published grammar gives an ERROR node
+      # there. The fork grammar also holds ABI 1019, which a published runtime refuses at load.
+      - name: Test that the binary holds the C++ fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          ag="$PWD/target/release/ast-grep"
+          "$ag" --version
+          cat > /tmp/fork_fixture.cpp <<'CPP'
+          struct B { explicit B(int (&a LIFETIMEBOUND)[4]) noexcept {} };
+          CPP
+          errors=$("$ag" scan --inline-rules 'id: e
+          language: cpp
+          rule: { kind: ERROR }' /tmp/fork_fixture.cpp --json=compact | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')
+          echo "ERROR nodes on the fork-only construct: $errors"
+          test "$errors" = 0
+          # And the parameter really parses, so the test cannot pass on an empty read.
+          params=$("$ag" scan --inline-rules 'id: p
+          language: cpp
+          rule: { kind: parameter_declaration }' /tmp/fork_fixture.cpp --json=compact | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')
+          echo "parameter_declaration nodes: $params"
+          test "$params" -ge 1
+
+      - name: Assemble the kit
+        id: kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="ast-grep-fork-${{ steps.tag.outputs.name }}-${{ matrix.platform }}"
+          mkdir -p "$name/bin"
+          cp target/release/ast-grep "$name/bin/"
+          cp target/release/sg "$name/bin/" 2>/dev/null || true
+          cp LICENSE "$name/" 2>/dev/null || true
+          grammar=$(grep -A2 'name = "tree-sitter-cpp"' Cargo.lock | grep source | grep -o '#[0-9a-f]\{40\}' | tr -d '#')
+          runtime=$(grep -A2 'name = "tree-sitter"$' Cargo.lock | grep source | grep -o '#[0-9a-f]\{40\}' | tr -d '#')
+          {
+            echo "kit                $name"
+            echo "platform           ${{ matrix.platform }}"
+            echo "runner             ${{ matrix.os }}"
+            echo "ast_grep_repo      ${{ github.repository }}"
+            echo "ast_grep_commit    ${{ github.sha }}"
+            echo "cpp_grammar_commit $grammar"
+            echo "cpp_runtime_commit $runtime"
+            echo "cpp_grammar_abi    1019"
+            echo "rust_toolchain     ${{ env.RUST_TOOLCHAIN }}"
+            echo "built_at           $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run       ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > "$name/MANIFEST.txt"
+          cat "$name/MANIFEST.txt"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.kit.outputs.name }}
+          path: |
+            ${{ steps.kit.outputs.name }}.tar.gz
+            ${{ steps.kit.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Release on GitHub
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Name the tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "name=${{ github.event.inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect the kits
+        uses: actions/download-artifact@v4
+        with:
+          path: kits
+          merge-multiple: true
+
+      - name: Write the notes
+        run: |
+          set -euo pipefail
+          cd kits
+          cat *.sha256 > SHA256SUMS
+          {
+            echo "ast-grep built against the C++ grammar and runtime of the GrigoryEvko forks."
+            echo
+            echo "Each build parses an attribute macro inside a parenthesized reference declarator and"
+            echo "reports no ERROR node. A binary with the published grammar fails that test."
+            echo
+            echo '## Use a binary in the CI of another project'
+            echo
+            echo '```yaml'
+            echo '- name: Get ast-grep'
+            echo '  run: |'
+            echo "    tag=${{ steps.tag.outputs.name }}"
+            echo '    kit=ast-grep-fork-$tag-linux-x64'
+            echo "    url=${{ github.server_url }}/${{ github.repository }}/releases/download/\$tag"
+            echo '    curl -sSfL "$url/$kit.tar.gz" -o kit.tar.gz'
+            echo '    curl -sSfL "$url/SHA256SUMS" -o SHA256SUMS'
+            echo '    grep " $kit.tar.gz$" SHA256SUMS | sha256sum -c -'
+            echo '    tar xzf kit.tar.gz'
+            echo '    echo "$PWD/$kit/bin" >> "$GITHUB_PATH"'
+            echo
+            echo '- name: Run the gates'
+            echo '  run: ast-grep scan'
+            echo '```'
+            echo
+            echo 'The binary needs no Rust toolchain and no C compiler, because the C++ grammar is'
+            echo 'compiled into it.'
+            echo
+            echo '## A C++ project needs `sgconfig.yml`'
+            echo
+            echo 'ast-grep gives the extension `.h` to C. A C++ project that keeps headers must map'
+            echo 'them, or ast-grep reports no match in them:'
+            echo
+            echo '```yaml'
+            echo 'languageGlobs:'
+            echo '  cpp: ["*.h"]'
+            echo '```'
+            echo
+            echo 'A negation pattern in that list does not work. To hold a file out of a scan, name it'
+            echo 'in the `ignores` list of each rule.'
+            echo
+            echo '## Write a C++ rule'
+            echo
+            echo 'Use `kind` for a structure. Use a pattern with `context` and `selector` for an'
+            echo 'expression or a macro call, because ast-grep parses a bare pattern at file scope,'
+            echo 'where C++ reads it as a declaration and it matches nothing.'
+            echo
+            echo '```yaml'
+            echo 'rule:'
+            echo '  pattern:'
+            echo '    context: "void _f(){ std::move($X); }"'
+            echo '    selector: call_expression'
+            echo '```'
+            echo
+            echo 'The Linux kits need glibc 2.39 or a later version.'
+          } > NOTES.md
+          cat NOTES.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd kits
+          gh release create "${{ steps.tag.outputs.name }}" \
+            --repo "${{ github.repository }}" \
+            --title "ast-grep fork ${{ steps.tag.outputs.name }}" \
+            --notes-file NOTES.md \
+            *.tar.gz SHA256SUMS
