@@ -18,7 +18,7 @@ serde.workspace = true
 tree-sitter.workspace = true
 
 tree-sitter-bash = { version = "0.25.0", optional = true }
-tree-sitter-cpp = { version = "0.23.0", optional = true }
+tree-sitter-cpp = { git = "https://github.com/GrigoryEvko/tree-sitter-cpp", rev = "c19c6bdfeb1398b70ad035d2d8ef94687f1286ce", optional = true }
 tree-sitter-c-sharp = { version = "0.23.0", optional = true }
 tree-sitter-css = { version = "0.25.0", optional = true }
 tree-sitter-dart = { version = "0.2.0", optional = true }

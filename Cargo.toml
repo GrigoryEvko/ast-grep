@@ -39,3 +39,13 @@ thiserror = "2.0.0"
 schemars = "1.0.0"
 anyhow = "1.0.82"
 dashmap = "6.0.0"
+
+# The C++ grammar of `crates/language` is the GrigoryEvko fork at ABI 1019. A runtime of the published
+# project reads a maximum of ABI 15 and refuses that grammar. So every crate that asks crates.io for
+# tree-sitter gets the fork runtime instead. The fork is version 0.27.0, so it meets the `0.27.0`
+# requirement of the workspace. `tree-sitter-language` comes from the same commit, because the runtime
+# takes it from its own workspace and a grammar crate takes it from crates.io, and the two copies
+# declare the same `links` value.
+[patch.crates-io]
+tree-sitter = { git = "https://github.com/GrigoryEvko/tree-sitter", rev = "31a914d29f8e909125df50f82512bf6477097568" }
+tree-sitter-language = { git = "https://github.com/GrigoryEvko/tree-sitter", rev = "31a914d29f8e909125df50f82512bf6477097568" }
